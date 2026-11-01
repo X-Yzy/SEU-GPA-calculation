@@ -1,6 +1,5 @@
 # SEU·绩点计算器
 
-@X_Y
 <img width="1920" height="1319" alt="7e919bedecc2dc4acf4c3e88a0213e8c" src="https://github.com/user-attachments/assets/116aaac6-e812-476c-8944-ac5b036c5ccb" />
 
 
