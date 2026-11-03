@@ -3330,8 +3330,10 @@ if __name__ == "__main__":
     except Exception:
         import traceback
         detail = traceback.format_exc()
+        if sys.stderr is not None:
+            sys.stderr.write(detail)
         try:
             messagebox.showerror("绩点计算器启动失败", "程序未能启动，错误信息如下：\n\n" + detail)
         except Exception:
-            if sys.stderr is not None:
-                sys.stderr.write(detail)
+            pass
+        raise SystemExit(1)
