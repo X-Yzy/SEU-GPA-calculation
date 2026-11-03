@@ -8,12 +8,13 @@ import json
 import os
 import re
 import sys
-from urllib.parse import urlparse
+from urllib.parse import quote, unquote, urlparse
 import csv
 import io
 import math
 import tempfile
 from datetime import datetime, timezone, timedelta
+from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
 import copy
 import queue
@@ -1482,11 +1483,13 @@ _ORIGINAL_CODE = compile(ORIGINAL_SCRIPT, "<内嵌的42225129大作业原稿>", 
 
 def score_to_grade_point(score, scale=4.8):
     """参考网站的东南大学分段方案；小数成绩按下限归档，不做插值。"""
-    import math
     if scale not in (4.0, 4.8):
         raise ValueError("只支持 4.0 或 4.8 制")
-    score = float(score)
-    if not math.isfinite(score) or not 0 <= score <= 100:
+    try:
+        score = Decimal(str(score))
+    except InvalidOperation:
+        raise ValueError("成绩必须是 0 到 100 之间的有限数字") from None
+    if not score.is_finite() or not 0 <= score <= 100:
         raise ValueError("成绩必须是 0 到 100 之间的有限数字")
     for minimum, point in [(96, 4.8), (93, 4.5), (90, 4.0), (86, 3.8),
                            (83, 3.5), (80, 3.0), (76, 2.8), (73, 2.5),
@@ -1531,6 +1534,7 @@ def grade_name_to_score(value):
         "不及格": 0.0,
         "不合格": 0.0,
         "未通过": 0.0,
+        "不通过": 0.0,
     }
     return mapping.get(text)
 
@@ -1726,19 +1730,68 @@ class OriginalScriptRun:
         self.last_observed_response = None
         self.network_hint = ""
         self.last_report = None
+        self.last_stage = "checking"
+        self.http_failure = None
+        self.transport_failure = ""
+        self.proxy_in_use = False
+        self.partial_hint = ""
+        self.pagination_failures = {}
+        self.sms_value = ""
 
     def cancelled(self):
         return self.cancel_event is not None and self.cancel_event.is_set()
 
     def report(self, stage, detail):
+        if stage in ("checking", "session", "fetching", "awaiting_sms", "sms_required"):
+            self.last_stage = stage
         if self.status_callback and (stage, detail) != self.last_report:
             self.last_report = (stage, detail)
             self.status_callback(stage, detail)
 
     def private_text(self, text):
-        for value in (self.password, self.username):
-            if value:
-                text = text.replace(value, "***")
+        from urllib.parse import unquote
+
+        values = tuple(value for value in (self.password, self.username, self.sms_value) if value)
+        for value in values:
+            text = text.replace(value, "***")
+        # 整个认证头都可能含多项凭据，连同折行内容一起遮蔽。
+        text = re.sub(
+            r"(?i)(\b(?:Proxy-Authorization|Authorization|Set-Cookie|Cookie)[\"']?\s*[:=])"
+            r"[^\r\n]*(?:\r?\n[ \t]+[^\r\n]*)*",
+            lambda match: match.group(1) + " [已隐藏]", text)
+
+        url_start = re.compile(r"\b[a-z][a-z0-9+.-]*://", re.I)
+
+        def encoded_url(match):
+            original = decoded = match.group()
+            # 仅解码诊断副本来识别多层编码；不保留其中的任何 URL 内容。
+            while "%" in decoded:
+                clearer = unquote(decoded)
+                if clearer == decoded:
+                    break
+                decoded = clearer
+                if (url_start.search(decoded)
+                        or (decoded.startswith("/") and ("?" in decoded or "#" in decoded))
+                        or any(value in decoded for value in values)):
+                    return "[网址已隐藏]"
+            return original
+
+        text = re.sub(r"[^\s<>\"']+", encoded_url, text)
+
+        # URL 查询参数及代理 userinfo 可能含票据或密码，只保留安全端点。
+        def endpoint(value):
+            try:
+                parsed = urlparse(value)
+                host = parsed.netloc.rsplit("@", 1)[-1]
+                return parsed._replace(netloc=host, query="", fragment="").geturl()
+            except ValueError:
+                return "[网址已隐藏]"
+
+        text = re.sub(r"\b[a-z][a-z0-9+.-]*://[^\s<>\"']+",
+                      lambda match: endpoint(match.group()), text, flags=re.I)
+        # requests 的重试异常也可能仅输出相对 URL。
+        text = re.sub(r"(\b(?:with\s+)?url\s*[:=]\s*[\"']?)(/[^\s<>\"']*)",
+                      lambda match: match.group(1) + endpoint(match.group(2)), text, flags=re.I)
         text = re.sub(r"(?<!\d)1\d{10}(?!\d)", "[手机号]", text)
         return re.sub(r"(?i)((?:password|token|ticket|cookie|mobileVerifyCode)[\"']?\s*[:=]\s*)[^\s,}]+", r"\1[已隐藏]", text)
 
@@ -1755,7 +1808,8 @@ class OriginalScriptRun:
             return self.username
         if "验证码" in prompt:
             self.report("awaiting_sms", "请输入收到的短信验证码。")
-            return self.sms_callback() if self.sms_callback else builtins.input(prompt)
+            self.sms_value = self.sms_callback() if self.sms_callback else builtins.input(prompt)
+            return self.sms_value
         raise RuntimeError("暂不支持当前输入请求：" + prompt)
 
     def read_password(self, prompt="", *args, **kwargs):
@@ -1767,16 +1821,71 @@ class OriginalScriptRun:
         namespace = {"__name__":"_embedded_seu_reference", "__file__":__file__}
         local_builtins = vars(builtins).copy()
         original_import = builtins.__import__
+        # 仅适配原稿的可选文件，不改变进程工作目录或其他模块的文件操作。
+        def resource_path(path):
+            return ROOT / "browser_packets.json" if path == "browser_packets.json" else path
+        os_adapter = types.ModuleType("os")
+        os_adapter.__dict__.update(vars(os))
+        path_adapter = types.ModuleType("os.path")
+        path_adapter.__dict__.update(vars(os.path))
+        path_adapter.exists = lambda path: os.path.exists(resource_path(path))
+        os_adapter.path = path_adapter
+        def local_open(path, *args, **kwargs):
+            return builtins.open(resource_path(path), *args, **kwargs)
         getpass_adapter = types.ModuleType("getpass")
         getpass_adapter.getpass = self.read_password
         def local_import(name, globals=None, locals=None, fromlist=(), level=0):
             if name == "getpass" and level == 0:
                 return getpass_adapter
-            return original_import(name, globals, locals, fromlist, level)
-        local_builtins.update(input=self.read_input, print=self.output, __import__=local_import)
+            if name == "os" and level == 0:
+                return os_adapter
+            module = original_import(name, globals, locals, fromlist, level)
+            if name == "requests" and level == 0:
+                try:
+                    self.proxy_in_use = any(module.utils.get_environ_proxies(url)
+                                            for url in (namespace["AUTH_DIST"], namespace["SEU_GRADE_API_HTTP"]))
+                except (AttributeError, OSError, ValueError):
+                    pass
+            return module
+        local_builtins.update(input=self.read_input, print=self.output, open=local_open, __import__=local_import)
         namespace["__builtins__"] = local_builtins
         self.namespace = namespace
         exec(_ORIGINAL_CODE, namespace)
+        # 教务获取和手动录入使用同一套等级别名。
+        namespace["grade_name_to_score"] = grade_name_to_score
+        original_finish = namespace["finish_auth_redirect"]
+        class RedirectSession:
+            # 所有请求仍交给同一个 Session，只规范原稿已有重定向的 URL 编码。
+            def __init__(self, session):
+                self.session = session
+            def __getattr__(self, name):
+                return getattr(self.session, name)
+            def get(self, url, *args, **kwargs):
+                prefix = namespace["AUTH_CASBACK"] + "/loginRedirect?redirectUrl="
+                if url.startswith(prefix):
+                    url = prefix + quote(unquote(url[len(prefix):]), safe="")
+                elif not url.lower().startswith(("http://", "https://")):
+                    decoded = unquote(url)
+                    if decoded.lower().startswith(("http://", "https://")):
+                        url = decoded
+                response = self.session.get(url, *args, **kwargs)
+                try:
+                    self_outer.observe_response(response)
+                except Exception:
+                    pass
+                return response
+        self_outer = self
+        def finish_auth_redirect(session, login_data):
+            return original_finish(RedirectSession(session), login_data)
+        namespace["finish_auth_redirect"] = finish_auth_redirect
+        original_adapt = namespace["adapt_ehall_url"]
+        def adapt_grade_url(url, referer):
+            # 保留原稿已有的 HTTPS 备用接口，避免 HTTP 落地时两个候选变成同一个 HTTP 请求。
+            parsed = urlparse(referer)
+            if url == namespace["SEU_GRADE_API"] and parsed.hostname == "ehall.seu.edu.cn" and parsed.scheme == "http":
+                return url
+            return original_adapt(url, referer)
+        namespace["adapt_ehall_url"] = adapt_grade_url
         return namespace
 
     def observe_response(self, response):
@@ -1795,9 +1904,42 @@ class OriginalScriptRun:
         if title:
             self.last_response += "；页面标题：" + re.sub(r"\s+", " ", html.unescape(title.group(1)))[:70]
         self.last_response = self.private_text(self.last_response)
+        if isinstance(status, int) and status >= 400:
+            self.http_failure = (status, self.last_stage, self.last_response)
         self.network_hint = ""
         if parsed.hostname == "vpn.seu.edu.cn" and parsed.path.startswith(("/portal/", "/controller/")) and "json" not in content_type.lower():
             self.network_hint = "当前请求进入了 VPN 门户，未返回教务成绩。请检查 VPN / 代理设置是否影响教务访问，调整后重试。"
+
+    def observe_exception(self, error):
+        response = getattr(error, "response", None)
+        if response is not None:
+            self.observe_response(response)
+        names = {cls.__name__ for cls in type(error).__mro__}
+        if "ProxyError" in names:
+            self.transport_failure = "无法连接当前代理。请检查系统 / 环境代理设置，或在可直连教务的网络下重试。"
+        elif "SSLError" in names:
+            self.transport_failure = "HTTPS 证书校验失败。请检查系统时间、网络代理及 Python 证书环境。"
+        elif "Timeout" in names:
+            self.transport_failure = "连接学校服务超时，请检查网络后重试。"
+        elif "ConnectionError" in names:
+            self.transport_failure = "无法连接学校服务，请检查网络和代理设置后重试。"
+
+    def failure_detail(self):
+        detail = self.network_hint or self.transport_failure
+        if not detail and self.http_failure:
+            status, stage, _ = self.http_failure
+            step = {"checking":"统一认证", "session":"教务会话建立", "fetching":"成绩查询"}.get(stage, "教务访问")
+            detail = f"{step}请求被拒绝（HTTP {status}）。"
+            if status == 403:
+                detail += "这不能直接判断为账号密码错误。请检查 VPN / 代理是否影响教务访问。"
+        detail = detail or self.last_message or "暂未获取到成绩，请稍后重试。"
+        if self.proxy_in_use and (self.http_failure or self.transport_failure):
+            detail += "\n检测到当前请求会使用系统 / 环境代理，请确认其可访问学校服务。"
+        if self.last_response:
+            detail += "\n" + self.last_response
+        if self.http_failure and self.http_failure[2] != self.last_response:
+            detail += "\n失败" + self.http_failure[2]
+        return detail
 
     def trace(self, frame, event, arg):
         if frame.f_globals is not self.namespace:
@@ -1812,7 +1954,7 @@ class OriginalScriptRun:
                 elif name == "collect_grade_api_urls":
                     self.report("fetching", "正在准备成绩查询…")
                 elif name == "fetch_grades_with_saved_packet_templates":
-                    present = Path("browser_packets.json").is_file()
+                    present = (ROOT / "browser_packets.json").is_file()
                     self.report("fetching", "正在加载查询配置…" if present else "正在尝试可用的成绩接口…")
                 elif name == "post_auth_json":
                     path = frame.f_locals.get("path", "")
@@ -1824,17 +1966,38 @@ class OriginalScriptRun:
                         self.report(*stages[path])
                 if name == "collect_grade_api_urls":
                     frame.f_trace_lines = False
-                elif name not in ("fetch_grades_from_seu", "fetch_grades_with_saved_packet_templates"):
+                elif name not in ("fetch_grades_from_seu", "fetch_grades_with_saved_packet_templates",
+                                  "post_auth_json", "login_with_new_auth_api", "finish_auth_redirect"):
                     return None
+            elif event == "exception":
+                self.observe_exception(arg[1])
+                rows = frame.f_locals.get("all_rows")
+                if rows and name in ("fetch_grades_from_seu", "fetch_grades_with_saved_packet_templates"):
+                    self.pagination_failures[id(frame)] = rows
             elif event == "return" and name == "collect_grade_api_urls":
                 self.report("fetching", "查询已准备好，正在读取课程…")
-            elif event == "line" and name in ("fetch_grades_from_seu", "fetch_grades_with_saved_packet_templates"):
+            elif event == "line" and name in ("fetch_grades_from_seu", "fetch_grades_with_saved_packet_templates",
+                                             "post_auth_json", "login_with_new_auth_api", "finish_auth_redirect"):
                 response = frame.f_locals.get("api_response")
                 if response is None:
                     response = frame.f_locals.get("response")
                 if response is None:
                     response = frame.f_locals.get("page_response")
+                if response is None:
+                    response = frame.f_locals.get("init_response")
                 self.observe_response(response)
+                rows = frame.f_locals.get("all_rows")
+                if rows and response is not None and getattr(response, "status_code", 0) >= 400:
+                    self.pagination_failures[id(frame)] = rows
+            elif event == "return" and arg and name in ("fetch_grades_from_seu", "fetch_grades_with_saved_packet_templates"):
+                rows = frame.f_locals.get("all_rows", [])
+                total = frame.f_locals.get("total_size")
+                page = frame.f_locals.get("page_number", 0)
+                if rows and total is not None and len(rows) < total:
+                    self.partial_hint = f"本次只获取到 {len(rows)} / {total} 条成绩，后续分页未完成；当前绩点可能不完整，请重试。"
+                elif rows and (self.pagination_failures.get(id(frame)) is rows
+                               or (total is None and page >= 50 and len(rows) % 100 == 0)):
+                    self.partial_hint = f"本次已获取 {len(rows)} 条成绩，但后续查询未正常完成，当前绩点可能不完整，请重试。"
         except Exception:
             # 观察失败不影响原稿的任何网络分支。
             pass
@@ -1848,19 +2011,25 @@ class OriginalScriptRun:
             sys.settrace(self.trace)
             result = namespace["fetch_grades_from_seu"]()
             if not result and not self.cancelled():
-                detail = self.network_hint or self.last_message or "暂未获取到成绩，请稍后重试。"
-                if self.last_response:
-                    detail += "\n" + self.last_response
-                self.report("grades_failed", detail)
+                stage = ("rejected" if self.last_message.startswith("认证登录失败") else
+                         "session_failed" if self.last_stage == "session" else
+                         "auth_failed" if self.last_stage in ("checking", "sms_required", "awaiting_sms") else
+                         "grades_failed")
+                if stage == "rejected" and self.sms_value:
+                    stage = "sms_rejected"
+                self.report(stage, self.failure_detail())
+            elif result and self.partial_hint and not self.cancelled():
+                self.report("grades_partial", self.partial_hint)
             return result
         except _OriginalCancelled:
             return []
         finally:
             sys.settrace(previous_trace)
-            self.username = self.password = ""
+            self.username = self.password = self.sms_value = ""
             self.sms_callback = self.status_callback = None
             self.last_report = None
             self.last_observed_response = None
+            self.pagination_failures.clear()
             if self.namespace is not None:
                 self.namespace.clear()
                 self.namespace = None
@@ -1915,15 +2084,28 @@ def normalize(row):
 
 def summary(courses):
     included = [c for c in courses if not c["excluded"]]
-    credits = sum(c["credit"] for c in included)
-    avg = sum(c["score"] * c["credit"] for c in included) / credits if credits else 0
     result = {"count": len(included), "excluded": len(courses) - len(included),
-              "credits": credits, "average": avg,
+              "credits": 0.0, "average": 0.0,
               "passed": sum(c["score"] >= 60 for c in included)}
-    for scale in (4.0, 4.8):
-        result[str(scale)] = sum(score_to_grade_point(c["score"], scale) * c["credit"]
-                                 for c in included) / credits if credits else 0
-        result[f"reference{scale}"] = score_to_grade_point(avg, scale) if credits else 0
+    weights = [(Decimal(str(c["score"])), Decimal(str(c["credit"]))) for c in included]
+    values = [value for pair in weights for value in pair]
+    # 覆盖完整乘积和求和所需位数，避免二进制浮点误差把临界均分降档。
+    highest = max((value.adjusted() for value in values), default=0)
+    lowest = min((value.as_tuple().exponent for value in values), default=0)
+    with localcontext() as context:
+        context.prec = max(28, 2 * (highest - lowest + 2) + len(str(len(weights))))
+        credits = sum((credit for _, credit in weights), Decimal(0))
+        total = sum((score * credit for score, credit in weights), Decimal(0))
+        result["credits"] = float(credits)
+        result["average"] = float(total / credits) if credits else 0.0
+        # 直接比较加权总分与分段下限×总学分，不让除法舍入提前升档。
+        reference = next((point for lower, point in RULES
+                          if total >= Decimal(lower) * credits), 0.0) if credits else 0.0
+        for scale in (4.0, 4.8):
+            points = sum((Decimal(str(score_to_grade_point(score, scale))) * credit
+                          for score, credit in weights), Decimal(0))
+            result[str(scale)] = float(points / credits) if credits else 0.0
+            result[f"reference{scale}"] = min(reference, scale)
     return result
 
 def import_text(text, suffix=".json"):
@@ -2401,6 +2583,8 @@ class App(tk.Tk):
         self.sms_event, self.sms_value = threading.Event(), ""
         self.busy = False
         self.login_window = None
+        self.login_diagnostic = ""
+        self.fetch_warning = ""
         self.sort_key, self.sort_reverse = "", False
         self.search = tk.StringVar()
         self.semester = tk.StringVar(value="全部学期")
@@ -2909,11 +3093,14 @@ class App(tk.Tk):
                 messagebox.showerror("信息不完整", "请输入账号和密码。", parent=win)
                 return
             password.set("")
+            self.login_diagnostic = ""
+            self.fetch_warning = ""
             self.busy = True
             self.cancel_fetch.clear()
             self.sync_button.set_enabled(False)
             self.login_submit.set_enabled(False)
             self.login_cancel.set_enabled(True)
+            self.login_copy.set_enabled(False)
             for entry in self.login_entries:
                 entry.configure(state="disabled")
             self.login_progress.start(12)
@@ -2944,7 +3131,9 @@ class App(tk.Tk):
                             errors.append(str(error))
                     self.events.put(("done", (valid, errors)))
                 except Exception as error:
-                    self.events.put(("error", str(error)))
+                    private = OriginalScriptRun(user, secret, None)
+                    private.sms_value = self.sms_value
+                    self.events.put(("error", private.private_text(str(error))))
                 finally:
                     _backend_sink.reset(log_token)
             # 关闭窗口时允许原脚本结束当前请求，不强制中断其会话。
@@ -2954,6 +3143,17 @@ class App(tk.Tk):
         self.login_cancel = self.button(frame, "取消获取", self.cancel_fetch.set)
         self.login_cancel.pack(fill="x", pady=(8, 0))
         self.login_cancel.set_enabled(False)
+        def copy_diagnostic():
+            module = sys.modules.get("requests")
+            version = getattr(module, "__version__", "未加载")
+            detail = self.login_diagnostic or self.login_detail.get()
+            diagnostic = f"{APP_TITLE}\nPython {sys.version.split()[0]}；requests {version}\n{detail}"
+            self.clipboard_clear()
+            self.clipboard_append(diagnostic)
+            self.status.set("已复制诊断信息（不含账号密码、验证码或 URL 查询参数）")
+        self.login_copy = self.button(frame, "复制诊断信息", copy_diagnostic)
+        self.login_copy.pack(fill="x", pady=(8, 0))
+        self.login_copy.set_enabled(False)
         win.bind("<Return>", lambda e: start())
         def dismiss():
             if self.busy:
@@ -2976,7 +3176,9 @@ class App(tk.Tk):
             else:
                 self.login_window.deiconify()
                 self.login_submit.set_enabled(True)
-                self.login_detail.set(detail)
+                self.login_diagnostic = detail
+                self.login_copy.set_enabled(True)
+                self.login_detail.set(detail.split("\n连接信息：", 1)[0])
                 for entry in self.login_entries:
                     entry.configure(state="normal")
                 self.login_entries[1].focus_set()
@@ -2994,16 +3196,22 @@ class App(tk.Tk):
                     stage, detail = payload
                     # 只保存固定阶段名，接口原文可能包含账号、手机号或令牌。
                     allowed = {"checking", "rejected", "sms_required", "sms_failed", "awaiting_sms",
-                               "verifying_sms", "sms_rejected", "authenticated", "fetching", "session", "session_failed", "grades_failed"}
+                               "verifying_sms", "sms_rejected", "authenticated", "fetching", "session",
+                               "auth_failed", "session_failed", "grades_failed", "grades_partial"}
                     self.log_event("认证阶段：" + (stage if stage in allowed else "unknown"))
-                    self.status.set(detail)
+                    if stage == "grades_partial":
+                        self.fetch_warning = detail
+                    self.login_diagnostic = detail
+                    self.status.set(detail.split("\n连接信息：", 1)[0])
                     if self.login_window is not None and self.login_window.winfo_exists():
-                        self.login_detail.set(detail)
+                        self.login_detail.set(detail.split("\n连接信息：", 1)[0])
                         step = ("① 正在检查账号密码" if stage == "checking" else
+                                "① 统一认证未完成" if stage == "auth_failed" else
                                 "① 账号密码认证未通过" if stage == "rejected" else
                                 "① 已完成首次认证  →  ② 短信验证未通过" if stage == "sms_rejected" else
                                 "① 认证已完成  →  ③ 教务会话建立失败" if stage == "session_failed" else
                                 "③ 成绩获取失败（请查看下方具体原因）" if stage == "grades_failed" else
+                                "③ 成绩获取未完成" if stage == "grades_partial" else
                                 "② 正在连接教务系统" if stage == "session" else
                                 "③ 正在查询成绩" if stage == "fetching" else
                                 "① 已收到二次验证要求  →  ② 短信验证" if stage in ("sms_required", "awaiting_sms", "verifying_sms", "sms_failed") else
@@ -3018,9 +3226,12 @@ class App(tk.Tk):
                         self.finish_login(True)
                         self.merge(*payload)
                         self.reset_filters()
+                        if self.fetch_warning:
+                            messagebox.showwarning("成绩可能不完整", self.fetch_warning, parent=self)
                     else:
                         self.log_event("成绩同步失败或未返回成绩")
-                        self.finish_login(False, self.status.get() + "\n请检查后重试，也可导入教务返回包。")
+                        detail = self.login_diagnostic or self.status.get()
+                        self.finish_login(False, detail + "\n可点击“复制诊断信息”查看具体接口，也可重试或导入教务返回包。")
                 elif kind == "error":
                     self.log_event("成绩同步异常")
                     self.status.set("同步失败，可改用返回包导入")
@@ -3062,15 +3273,33 @@ class App(tk.Tk):
         target = simpledialog.askfloat("均分目标", "希望达到的加权均分（0–100）：", minvalue=0, maxvalue=100, parent=self)
         if target is None:
             return
+        if not math.isfinite(target) or not 0 <= target <= 100:
+            messagebox.showerror("请检查输入", "目标均分须为 0–100 之间的有限数字。", parent=self)
+            return
         credits = simpledialog.askfloat("未来学分", "计划新增多少学分？", minvalue=.01, parent=self)
         if credits is None:
             return
-        needed = (target * (s["credits"] + credits) - s["average"] * s["credits"]) / credits
-        msg = f"当前范围计入 {s['credits']:g} 学分，均分 {s['average']:.2f}。\n新增 {credits:g} 学分需达到均分 {needed:.2f}。"
-        if needed > 100:
-            msg += "\n按当前计划无法达到目标，可增加未来学分或调整目标。"
-        elif needed < 0:
-            msg += "\n即使未来均分为 0，也已满足这个目标。"
+        if not math.isfinite(credits) or credits <= 0:
+            messagebox.showerror("请检查输入", "未来学分须为大于 0 的有限数字。", parent=self)
+            return
+        weights = [(Decimal(str(c["score"])), Decimal(str(c["credit"])))
+                   for c in self.visible if not c["excluded"]]
+        target_value, future = Decimal(str(target)), Decimal(str(credits))
+        values = [value for pair in weights for value in pair] + [target_value, future]
+        highest = max(value.adjusted() for value in values)
+        lowest = min(value.as_tuple().exponent for value in values)
+        with localcontext() as context:
+            context.prec = max(28, 2 * (highest - lowest + 2) + len(str(len(weights) + 1)))
+            current = sum((credit for _, credit in weights), Decimal(0))
+            total = sum((score * credit for score, credit in weights), Decimal(0))
+            required = target_value * (current + future) - total
+            needed = required / future
+            msg = f"当前范围计入 {current:g} 学分，均分 {s['average']:.2f}。\n新增 {credits:g} 学分需达到均分 {needed:.2f}。"
+            # 用原始加权总分判断可达性，不从已转为浮点数的均分反推。
+            if required > 100 * future:
+                msg += "\n所需均分超过 100，按当前计划无法达到目标，可增加未来学分或调整目标。"
+            elif required <= 0:
+                msg += "\n即使未来均分为 0，也已满足这个目标。"
         messagebox.showinfo("目标预测", msg, parent=self)
 
     def demo(self):
